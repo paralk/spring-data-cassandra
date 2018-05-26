@@ -1,185 +1,225 @@
+/*
+ * Copyright 2016-2018 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package org.springframework.data.cassandra.repository.query;
 
 import java.lang.reflect.Method;
-import java.math.BigDecimal;
-import java.math.BigInteger;
-import java.net.InetAddress;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.UUID;
+import java.util.Optional;
 
-import org.springframework.core.annotation.AnnotationUtils;
+import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
-import org.springframework.data.cassandra.mapping.CassandraMappingContext;
+import org.springframework.data.cassandra.core.mapping.CassandraPersistentEntity;
+import org.springframework.data.cassandra.core.mapping.CassandraPersistentProperty;
+import org.springframework.data.cassandra.repository.Consistency;
 import org.springframework.data.cassandra.repository.Query;
+import org.springframework.data.mapping.context.MappingContext;
+import org.springframework.data.projection.ProjectionFactory;
 import org.springframework.data.repository.core.RepositoryMetadata;
 import org.springframework.data.repository.query.QueryMethod;
 import org.springframework.data.util.ClassTypeInformation;
 import org.springframework.data.util.TypeInformation;
+import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
 import org.springframework.util.ClassUtils;
 import org.springframework.util.StringUtils;
 
+import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.ResultSet;
 
+/**
+ * Cassandra specific implementation of {@link QueryMethod}.
+ *
+ * @author Matthew Adams
+ * @author Oliver Gierke
+ * @author Mark Paluch
+ * @author John Blum
+ */
 public class CassandraQueryMethod extends QueryMethod {
 
-	// TODO: double-check this list
-	public static final List<Class<?>> ALLOWED_PARAMETER_TYPES = Collections.unmodifiableList(Arrays
-			.asList(new Class<?>[] { String.class, CharSequence.class, char.class, Character.class, char[].class, long.class,
-					Long.class, boolean.class, Boolean.class, BigDecimal.class, BigInteger.class, double.class, Double.class,
-					float.class, Float.class, InetAddress.class, Date.class, UUID.class, int.class, Integer.class }));
+	private final Method method;
 
-	public static final List<Class<?>> STRING_LIKE_PARAMETER_TYPES = Collections.unmodifiableList(Arrays
-			.asList(new Class<?>[] { CharSequence.class, char.class, Character.class, char[].class }));
+	private final MappingContext<? extends CassandraPersistentEntity<?>, ? extends CassandraPersistentProperty> mappingContext;
 
-	public static final List<Class<?>> DATE_PARAMETER_TYPES = Collections.unmodifiableList(Arrays
-			.asList(new Class<?>[] { Date.class }));
+	private final Optional<Query> query;
 
-	public static boolean isMapOfCharSequenceToObject(TypeInformation<?> type) {
+	private final Optional<Consistency> consistency;
 
-		if (!type.isMap()) {
-			return false;
-		}
+	private @Nullable CassandraEntityMetadata<?> entityMetadata;
 
-		TypeInformation<?> keyType = type.getComponentType();
-		TypeInformation<?> valueType = type.getMapValueType();
+	/**
+	 * Create a new {@link CassandraQueryMethod} from the given {@link Method}.
+	 *
+	 * @param method must not be {@literal null}.
+	 * @param repositoryMetadata must not be {@literal null}.
+	 * @param projectionFactory must not be {@literal null}.
+	 * @param mappingContext must not be {@literal null}.
+	 */
+	public CassandraQueryMethod(Method method, RepositoryMetadata repositoryMetadata, ProjectionFactory projectionFactory,
+			MappingContext<? extends CassandraPersistentEntity<?>, ? extends CassandraPersistentProperty> mappingContext) {
 
-		return ClassUtils.isAssignable(CharSequence.class, keyType.getType()) && Object.class.equals(valueType.getType());
-	}
+		super(method, repositoryMetadata, projectionFactory);
 
-	protected Method method;
-	protected CassandraMappingContext mappingContext;
-	protected Query query;
-	protected String queryString;
-	protected boolean queryCached = false;
-	protected Set<Integer> stringLikeParameterIndexes = new HashSet<Integer>();
-	protected Set<Integer> dateParameterIndexes = new HashSet<Integer>();
+		Assert.notNull(mappingContext, "MappingContext must not be null");
 
-	public CassandraQueryMethod(Method method, RepositoryMetadata metadata, CassandraMappingContext mappingContext) {
-
-		super(method, metadata);
-
-		verify(method, metadata);
+		verify(method, repositoryMetadata);
 
 		this.method = method;
-
-		Assert.notNull(mappingContext, "MappingContext must not be null!");
 		this.mappingContext = mappingContext;
+		this.query = Optional.ofNullable(AnnotatedElementUtils.findMergedAnnotation(method, Query.class));
+		this.consistency = Optional.ofNullable(AnnotatedElementUtils.findMergedAnnotation(method, Consistency.class));
 	}
 
+	/**
+	 * Validates that this query is not a page query.
+	 */
+	@SuppressWarnings("unused")
 	public void verify(Method method, RepositoryMetadata metadata) {
 
-		// TODO: support Page & Slice queries
-		if (isSliceQuery() || isPageQuery()) {
-			throw new InvalidDataAccessApiUsageException("neither slice nor page queries are supported yet");
-		}
-
-		Set<Class<?>> offendingTypes = new HashSet<Class<?>>();
-
-		int i = 0;
-		for (Class<?> type : method.getParameterTypes()) {
-			if (!ALLOWED_PARAMETER_TYPES.contains(type)) {
-				offendingTypes.add(type);
-			}
-			for (Class<?> quotedType : STRING_LIKE_PARAMETER_TYPES) {
-				if (quotedType.isAssignableFrom(type)) {
-					stringLikeParameterIndexes.add(i);
-				}
-			}
-			for (Class<?> quotedType : DATE_PARAMETER_TYPES) {
-				if (quotedType.isAssignableFrom(type)) {
-					dateParameterIndexes.add(i);
-				}
-			}
-			i++;
-		}
-
-		if (offendingTypes.size() > 0) {
-			throw new IllegalArgumentException(String.format(
-					"encountered unsupported query parameter type%s [%s] in method %s", offendingTypes.size() == 1 ? "" : "s",
-					StringUtils.arrayToCommaDelimitedString(new ArrayList<Class<?>>(offendingTypes).toArray()), method));
+		if (isPageQuery()) {
+			throw new InvalidDataAccessApiUsageException("Page queries are not supported. Use a Slice query.");
 		}
 	}
 
+	/*
+	 * (non-Javadoc)
+	 * @see org.springframework.data.repository.query.QueryMethod#getEntityInformation()
+	 */
+	@Override
+	@SuppressWarnings("unchecked")
+	public CassandraEntityMetadata<?> getEntityInformation() {
+
+		if (this.entityMetadata == null) {
+
+			Class<?> returnedObjectType = getReturnedObjectType();
+			Class<?> domainClass = getDomainClass();
+
+			if (ClassUtils.isPrimitiveOrWrapper(returnedObjectType)) {
+				this.entityMetadata = new SimpleCassandraEntityMetadata<>((Class<Object>) domainClass,
+						this.mappingContext.getRequiredPersistentEntity(domainClass));
+
+			} else {
+
+				CassandraPersistentEntity<?> returnedEntity = this.mappingContext.getPersistentEntity(returnedObjectType);
+				CassandraPersistentEntity<?> managedEntity = this.mappingContext.getRequiredPersistentEntity(domainClass);
+
+				returnedEntity = returnedEntity == null || returnedEntity.getType().isInterface()
+						? managedEntity : returnedEntity;
+
+				this.entityMetadata = new SimpleCassandraEntityMetadata<>((Class<Object>) returnedEntity.getType(),
+						managedEntity);
+			}
+		}
+
+		return this.entityMetadata;
+	}
+
+	/*
+	 * (non-Javadoc)
+	 * @see org.springframework.data.repository.query.QueryMethod#getParameters()
+	 */
+	@Override
+	public CassandraParameters getParameters() {
+		return (CassandraParameters) super.getParameters();
+	}
+
+	/* (non-Javadoc)
+	 * @see org.springframework.data.repository.query.QueryMethod#createParameters(java.lang.reflect.Method)
+	 */
 	@Override
 	protected CassandraParameters createParameters(Method method) {
 		return new CassandraParameters(method);
 	}
 
 	/**
-	 * Returns the {@link Query} annotation that is applied to the method or {@code null} if none available.
-	 */
-	Query getQueryAnnotation() {
-		if (query == null) {
-			query = method.getAnnotation(Query.class);
-			queryCached = true;
-		}
-		return query;
-	}
-
-	/**
 	 * Returns whether the method has an annotated query.
 	 */
 	public boolean hasAnnotatedQuery() {
-		return getAnnotatedQuery() != null;
+		return this.query.map(Query::value).filter(StringUtils::hasText).isPresent();
 	}
 
 	/**
 	 * Returns the query string declared in a {@link Query} annotation or {@literal null} if neither the annotation found
 	 * nor the attribute was specified.
+	 *
+	 * @return the query string or {@literal null} if no query string present.
 	 */
+	@Nullable
 	public String getAnnotatedQuery() {
-
-		if (!queryCached) {
-			queryString = (String) AnnotationUtils.getValue(getQueryAnnotation());
-			queryString = StringUtils.hasText(queryString) ? queryString : null;
-		}
-
-		return queryString;
+		return this.query.map(Query::value).orElse(null);
 	}
 
+	/**
+	 * @return whether the method has an annotated {@link com.datastax.driver.core.ConsistencyLevel}.
+	 * @since 2.0
+	 */
+	public boolean hasConsistencyLevel() {
+		return consistency.isPresent();
+	}
+
+	/**
+	 * Returns the {@link ConsistencyLevel} in a {@link Query} annotation or throws {@link IllegalStateException} if the
+	 * annotation was not found.
+	 *
+	 * @return the {@link ConsistencyLevel}.
+	 * @throws IllegalStateException if the required annotation was not found.
+	 */
+	public ConsistencyLevel getRequiredAnnotatedConsistencyLevel() throws IllegalStateException {
+		return this.consistency.map(Consistency::value)
+				.orElseThrow(() -> new IllegalStateException("No @Consistency annotation found"));
+	}
+
+	/**
+	 * Returns the required query string declared in a {@link Query} annotation or throws {@link IllegalStateException} if
+	 * neither the annotation found nor the attribute was specified.
+	 *
+	 * @return the query string.
+	 * @throws IllegalStateException in case query method has no annotated query.
+	 */
+	public String getRequiredAnnotatedQuery() {
+		return this.query.map(Query::value)
+				.orElseThrow(() -> new IllegalStateException("Query method " + this + " has no annotated query"));
+	}
+
+	/**
+	 * Returns the {@link Query} annotation that is applied to the method or {@literal null} if none available.
+	 *
+	 * @return the optional query annotation.
+	 */
+	Optional<Query> getQueryAnnotation() {
+		return this.query;
+	}
+
+	@Override
+	protected Class<?> getDomainClass() {
+		return super.getDomainClass();
+	}
+
+	/**
+	 * @return the return type for this {@link QueryMethod}.
+	 */
 	public TypeInformation<?> getReturnType() {
-		return ClassTypeInformation.fromReturnTypeOf(method);
+		return ClassTypeInformation.fromReturnTypeOf(this.method);
 	}
 
+	/**
+	 * @return true is the method returns a {@link ResultSet}.
+	 */
 	public boolean isResultSetQuery() {
-		return ResultSet.class.isAssignableFrom(method.getReturnType());
-	}
 
-	public boolean isSingleEntityQuery() {
-		return ClassUtils.isAssignable(getDomainClass(), method.getReturnType());
-	}
+		TypeInformation<?> actualType = getReturnType().getActualType();
 
-	public boolean isCollectionOfEntityQuery() {
-		return isQueryForEntity() && isCollectionQuery();
-	}
-
-	public boolean isMapOfCharSequenceToObjectQuery() {
-
-		return isMapOfCharSequenceToObject(getReturnType());
-	}
-
-	public boolean isListOfMapOfCharSequenceToObject() {
-
-		TypeInformation<?> type = getReturnType();
-		if (!ClassUtils.isAssignable(List.class, type.getType())) {
-			return false;
-		}
-
-		return isMapOfCharSequenceToObject(type.getComponentType());
-	}
-
-	public boolean isStringLikeParameter(int parameterIndex) {
-		return stringLikeParameterIndexes.contains(parameterIndex);
-	}
-
-	public boolean isDateParameter(int parameterIndex) {
-		return dateParameterIndexes.contains(parameterIndex);
+		return actualType != null && ResultSet.class.isAssignableFrom(actualType.getType());
 	}
 }

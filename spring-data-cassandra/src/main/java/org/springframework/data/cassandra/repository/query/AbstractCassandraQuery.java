@@ -1,5 +1,5 @@
 /*
- * Copyright 2010-2014 the original author or authors.
+ * Copyright 2010-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,198 +15,163 @@
  */
 package org.springframework.data.cassandra.repository.query;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.SortedSet;
-import java.util.TreeSet;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.cassandra.core.converter.ResultSetToBigDecimalConverter;
-import org.springframework.cassandra.core.converter.ResultSetToBigIntegerConverter;
-import org.springframework.cassandra.core.converter.ResultSetToBooleanConverter;
-import org.springframework.cassandra.core.converter.ResultSetToByteBufferConverter;
-import org.springframework.cassandra.core.converter.ResultSetToDateConverter;
-import org.springframework.cassandra.core.converter.ResultSetToDoubleConverter;
-import org.springframework.cassandra.core.converter.ResultSetToFloatConverter;
-import org.springframework.cassandra.core.converter.ResultSetToInetAddressConverter;
-import org.springframework.cassandra.core.converter.ResultSetToIntegerConverter;
-import org.springframework.cassandra.core.converter.ResultSetToListConverter;
-import org.springframework.cassandra.core.converter.ResultSetToLongConverter;
-import org.springframework.cassandra.core.converter.ResultSetToStringConverter;
-import org.springframework.cassandra.core.converter.ResultSetToUuidConverter;
-import org.springframework.cassandra.core.converter.RowToMapConverter;
-import org.springframework.core.convert.ConversionService;
-import org.springframework.core.convert.TypeDescriptor;
 import org.springframework.core.convert.converter.Converter;
-import org.springframework.core.convert.support.ConfigurableConversionService;
-import org.springframework.core.convert.support.DefaultConversionService;
-import org.springframework.data.cassandra.convert.CassandraConverter;
 import org.springframework.data.cassandra.core.CassandraOperations;
+import org.springframework.data.cassandra.core.convert.CassandraConverter;
+import org.springframework.data.cassandra.core.mapping.CassandraMappingContext;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.CollectionExecution;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.ExistsExecution;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.ResultProcessingConverter;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.ResultProcessingExecution;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.ResultSetQuery;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.SingleEntityExecution;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.SlicedExecution;
+import org.springframework.data.cassandra.repository.query.CassandraQueryExecution.StreamExecution;
 import org.springframework.data.repository.query.ParameterAccessor;
 import org.springframework.data.repository.query.RepositoryQuery;
+import org.springframework.data.repository.query.ResultProcessor;
+import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
-import org.springframework.util.ClassUtils;
 
-import com.datastax.driver.core.ResultSet;
-import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Statement;
 
 /**
  * Base class for {@link RepositoryQuery} implementations for Cassandra.
+ *
+ * @author Mark Paluch
+ * @author John Blum
+ * @see org.springframework.data.cassandra.repository.query.CassandraRepositoryQuerySupport
  */
-public abstract class AbstractCassandraQuery implements RepositoryQuery {
+public abstract class AbstractCassandraQuery extends CassandraRepositoryQuerySupport {
 
-	protected static final Converter<?, ?>[] DEFAULT_CONVERTERS = new Converter<?, ?>[] { new ResultSetToListConverter(),
-			new ResultSetToStringConverter(), new RowToMapConverter(), new ResultSetToBigDecimalConverter(),
-			new ResultSetToBigIntegerConverter(), new ResultSetToBooleanConverter(), new ResultSetToByteBufferConverter(),
-			new ResultSetToDateConverter(), new ResultSetToDoubleConverter(), new ResultSetToFloatConverter(),
-			new ResultSetToInetAddressConverter(), new ResultSetToIntegerConverter(), new ResultSetToLongConverter(),
-			new ResultSetToUuidConverter() };
+	private final CassandraOperations operations;
 
-	protected static Logger log = LoggerFactory.getLogger(AbstractCassandraQuery.class);
+	private static CassandraConverter toConverter(CassandraOperations operations) {
 
-	private ConversionService conversionService;
+		Assert.notNull(operations, "CassandraOperations must not be null");
 
-	Converter<ResultSet, List<Map<String, Object>>> resultSetToListConverter = new ResultSetToListConverter();
+		return operations.getConverter();
+	}
 
-	private final CassandraQueryMethod method;
-	private final CassandraOperations template;
-
-	protected RowToMapConverter rowToMapConverter = new RowToMapConverter();
+	private static CassandraMappingContext toMappingContext(CassandraOperations operations) {
+		return toConverter(operations).getMappingContext();
+	}
 
 	/**
-	 * Creates a new {@link AbstractCassandraQuery} from the given {@link CassandraQueryMethod} and
+	 * Create a new {@link AbstractCassandraQuery} from the given {@link CassandraQueryMethod} and
 	 * {@link CassandraOperations}.
-	 * 
-	 * @param method must not be {@literal null}.
-	 * @param template must not be {@literal null}.
+	 *
+	 * @param queryMethod must not be {@literal null}.
+	 * @param operations must not be {@literal null}.
 	 */
-	public AbstractCassandraQuery(CassandraQueryMethod method, CassandraOperations operations) {
+	public AbstractCassandraQuery(CassandraQueryMethod queryMethod, CassandraOperations operations) {
 
-		Assert.notNull(operations);
-		Assert.notNull(method);
+		super(queryMethod, toMappingContext(operations));
 
-		this.method = method;
-		this.template = operations;
-
-		this.conversionService = createDefaultConversionService();
+		this.operations = operations;
 	}
 
-	protected ConfigurableConversionService createDefaultConversionService() {
-
-		ConfigurableConversionService conversionService = new DefaultConversionService();
-
-		for (Converter<?, ?> converter : DEFAULT_CONVERTERS) {
-			conversionService.addConverter(converter);
-		}
-
-		return conversionService;
+	/**
+	 * Return a reference to the {@link CassandraOperations} used to execute this Cassandra query.
+	 *
+	 * @return a reference to the {@link CassandraOperations} used to execute this Cassandra query.
+	 * @see org.springframework.data.cassandra.core.CassandraOperations
+	 */
+	protected CassandraOperations getOperations() {
+		return this.operations;
 	}
 
-	@Override
-	public CassandraQueryMethod getQueryMethod() {
-		return method;
-	}
-
+	/* (non-Javadoc)
+	 * @see org.springframework.data.repository.query.RepositoryQuery#execute(java.lang.Object[])
+	 */
+	@Nullable
 	@Override
 	public Object execute(Object[] parameters) {
 
-		CassandraParameterAccessor accessor = new CassandraParametersParameterAccessor(method, parameters);
-		String query = createQuery(accessor);
+		CassandraParameterAccessor parameterAccessor = new ConvertingParameterAccessor(toConverter(getOperations()),
+				new CassandraParametersParameterAccessor(getQueryMethod(), parameters));
 
-		ResultSet resultSet = template.query(query);
+		ResultProcessor resultProcessor = getQueryMethod().getResultProcessor().withDynamicProjection(parameterAccessor);
 
-		// return raw result set if requested
-		if (method.isResultSetQuery()) {
-			return resultSet;
-		}
+		Statement statement = createQuery(parameterAccessor);
 
-		Class<?> declaredReturnType = method.getReturnType().getType();
-		Class<?> returnedUnwrappedObjectType = method.getReturnedObjectType();
+		CassandraQueryExecution queryExecution = getExecution(parameterAccessor, new ResultProcessingConverter(
+				resultProcessor, toMappingContext(getOperations()), getEntityInstantiators()));
 
-		if (method.isSingleEntityQuery()) {
-			return getSingleEntity(resultSet, returnedUnwrappedObjectType);
-		}
+		Class<?> resultType = resolveResultType(resultProcessor);
 
-		Object retval = resultSet;
-
-		if (method.isCollectionOfEntityQuery()) {
-			retval = getCollectionOfEntity(resultSet, declaredReturnType, returnedUnwrappedObjectType);
-		}
-
-		// TODO: support Page & Slice queries
-
-		// if we get this far, let the configured conversion service try to convert the result set
-		return conversionService.convert(retval, TypeDescriptor.forObject(retval),
-				TypeDescriptor.valueOf(declaredReturnType));
+		return queryExecution.execute(statement, resultType);
 	}
 
-	public Object getCollectionOfEntity(ResultSet resultSet, Class<?> declaredReturnType,
-			Class<?> returnedUnwrappedObjectType) {
+	private Class<?> resolveResultType(ResultProcessor resultProcessor) {
 
-		Collection<Object> results = null;
+		CassandraReturnedType returnedType = new CassandraReturnedType(resultProcessor.getReturnedType(),
+				getOperations().getConverter().getCustomConversions());
 
-		if (ClassUtils.isAssignable(SortedSet.class, declaredReturnType)) {
-			results = new TreeSet<Object>();
-		} else if (ClassUtils.isAssignable(Set.class, declaredReturnType)) {
-			results = new HashSet<Object>();
-		} else { // List.class, Collection.class, or array
-			results = new ArrayList<Object>();
-		}
-
-		CassandraConverter converter = template.getConverter();
-		for (Row row : resultSet) {
-			results.add(converter.read(returnedUnwrappedObjectType, row));
-		}
-
-		return results;
-	}
-
-	public Object getSingleEntity(ResultSet resultSet, Class<?> type) {
-		if (resultSet.isExhausted()) {
-			return null;
-		}
-
-		Iterator<Row> iterator = resultSet.iterator();
-		Object object = template.getConverter().read(type, iterator.next());
-
-		warnIfMoreResults(iterator);
-
-		return object;
-	}
-
-	protected void warnIfMoreResults(Iterator<Row> iterator) {
-		if (log.isWarnEnabled() && iterator.hasNext()) {
-
-			int i = 0;
-			while (iterator.hasNext()) {
-				iterator.next();
-				i++;
-			}
-
-			log.warn("ignoring extra {} row{}", i, i == 1 ? "" : "s");
-		}
-	}
-
-	public ConversionService getConversionService() {
-		return conversionService;
-	}
-
-	public void setConversionService(ConversionService conversionService) {
-
-		Assert.notNull(conversionService);
-		this.conversionService = conversionService;
+		return returnedType.isProjecting() ? returnedType.getDomainType() : returnedType.getReturnedType();
 	}
 
 	/**
-	 * Creates a string query using the given {@link ParameterAccessor}
-	 * 
+	 * Creates a {@link Statement} using the given {@link ParameterAccessor}
+	 *
 	 * @param accessor must not be {@literal null}.
 	 */
-	protected abstract String createQuery(CassandraParameterAccessor accessor);
+	protected abstract Statement createQuery(CassandraParameterAccessor accessor);
+
+	/**
+	 * Returns the execution instance to use.
+	 *
+	 * @param parameterAccessor must not be {@literal null}.
+	 * @param resultProcessing must not be {@literal null}.
+	 * @return a wrapped {@link CassandraQueryExecution} to execute this query method.
+	 */
+	private CassandraQueryExecution getExecution(CassandraParameterAccessor parameterAccessor,
+			Converter<Object, Object> resultProcessing) {
+
+		return new ResultProcessingExecution(getExecutionToWrap(parameterAccessor, resultProcessing), resultProcessing);
+	}
+
+	private CassandraQueryExecution getExecutionToWrap(CassandraParameterAccessor parameterAccessor,
+			Converter<Object, Object> resultProcessing) {
+
+		if (getQueryMethod().isSliceQuery()) {
+			return new SlicedExecution(getOperations(), parameterAccessor.getPageable());
+		} else if (getQueryMethod().isCollectionQuery()) {
+			return new CollectionExecution(getOperations());
+		} else if (getQueryMethod().isResultSetQuery()) {
+			return new ResultSetQuery(getOperations());
+		} else if (getQueryMethod().isStreamQuery()) {
+			return new StreamExecution(getOperations(), resultProcessing);
+		} else if (isCountQuery()) {
+			return ((statement, type) -> new SingleEntityExecution(getOperations(), false).execute(statement, Long.class));
+		} else if (isExistsQuery()) {
+			return new ExistsExecution(getOperations());
+		} else {
+			return new SingleEntityExecution(getOperations(), isLimiting());
+		}
+	}
+
+	/**
+	 * Returns whether the query should get a count projection applied.
+	 *
+	 * @return a boolean value indicating whether the query is a count projection.
+	 * @since 2.1
+	 */
+	protected abstract boolean isCountQuery();
+
+	/**
+	 * Returns whether the query should get an exists projection applied.
+	 *
+	 * @return a boolean value indicating whether the query is an exists projection.
+	 * @since 2.1
+	 */
+	protected abstract boolean isExistsQuery();
+
+	/**
+	 * Return whether the query has an explicit limit set.
+	 *
+	 * @return a boolean value indicating whether the query has an explicit limit set.
+	 * @since 2.0.4
+	 */
+	protected abstract boolean isLimiting();
 }

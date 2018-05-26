@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2013 the original author or authors.
+ * Copyright 2014-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,46 +17,117 @@ package org.springframework.data.cassandra.repository.query;
 
 import org.springframework.data.cassandra.core.CassandraOperations;
 import org.springframework.data.cassandra.core.CassandraTemplate;
-import org.springframework.data.cassandra.mapping.CassandraMappingContext;
+import org.springframework.data.cassandra.core.StatementFactory;
+import org.springframework.data.cassandra.core.convert.UpdateMapper;
+import org.springframework.data.cassandra.core.mapping.CassandraMappingContext;
+import org.springframework.data.cassandra.core.mapping.CassandraPersistentEntity;
+import org.springframework.data.cassandra.core.mapping.CassandraPersistentProperty;
+import org.springframework.data.mapping.context.MappingContext;
 import org.springframework.data.repository.query.QueryMethod;
 import org.springframework.data.repository.query.RepositoryQuery;
 import org.springframework.data.repository.query.parser.PartTree;
 
+import com.datastax.driver.core.Statement;
+
 /**
  * {@link RepositoryQuery} implementation for Cassandra.
- * 
+ *
+ * @author Matthew Adams
+ * @author Mark Paluch
+ * @see org.springframework.data.cassandra.repository.query.AbstractCassandraQuery
  */
 public class PartTreeCassandraQuery extends AbstractCassandraQuery {
 
+	private final MappingContext<? extends CassandraPersistentEntity<?>, CassandraPersistentProperty> mappingContext;
+
 	private final PartTree tree;
-	private final CassandraMappingContext context;
+
+	private final StatementFactory statementFactory;
 
 	/**
-	 * Creates a new {@link PartTreeCassandraQuery} from the given {@link QueryMethod} and {@link CassandraTemplate}.
-	 * 
-	 * @param method must not be {@literal null}.
-	 * @param template must not be {@literal null}.
+	 * Create a new {@link PartTreeCassandraQuery} from the given {@link QueryMethod} and {@link CassandraTemplate}.
+	 *
+	 * @param queryMethod must not be {@literal null}.
+	 * @param operations must not be {@literal null}.
 	 */
-	public PartTreeCassandraQuery(CassandraQueryMethod method, CassandraOperations cassandraOperations) {
+	public PartTreeCassandraQuery(CassandraQueryMethod queryMethod, CassandraOperations operations) {
 
-		super(method, cassandraOperations);
-		this.tree = new PartTree(method.getName(), method.getEntityInformation().getJavaType());
-		this.context = cassandraOperations.getConverter().getMappingContext();
+		super(queryMethod, operations);
+
+		this.tree = new PartTree(queryMethod.getName(), queryMethod.getResultProcessor().getReturnedType().getDomainType());
+		this.mappingContext = operations.getConverter().getMappingContext();
+		this.statementFactory = new StatementFactory(new UpdateMapper(operations.getConverter()));
+	}
+
+	/**
+	 * Returns the {@link MappingContext} used by this query to access mapping meta-data used to store (map) objects to
+	 * Cassandra tables.
+	 *
+	 * @return the {@link MappingContext} used by this query.
+	 * @see CassandraMappingContext
+	 */
+	protected MappingContext<? extends CassandraPersistentEntity<?>, CassandraPersistentProperty> getMappingContext() {
+		return this.mappingContext;
+	}
+
+	/**
+	 * Returns the {@link StatementFactory} used by this query to construct and run Cassandra CQL statements.
+	 *
+	 * @return the {@link StatementFactory} used by this query to construct and run Cassandra CQL statements.
+	 * @see org.springframework.data.cassandra.core.StatementFactory
+	 */
+	protected StatementFactory getStatementFactory() {
+		return this.statementFactory;
 	}
 
 	/**
 	 * Return the {@link PartTree} backing the query.
-	 * 
+	 *
 	 * @return the tree
 	 */
-	public PartTree getTree() {
-		return tree;
+	protected PartTree getTree() {
+		return this.tree;
 	}
 
+	/*
+	 * (non-Javadoc)
+	 * @see org.springframework.data.cassandra.repository.query.AbstractCassandraQuery#createQuery(org.springframework.data.cassandra.repository.query.CassandraParameterAccessor, boolean)
+	 */
 	@Override
-	protected String createQuery(CassandraParameterAccessor accessor) {
+	protected Statement createQuery(CassandraParameterAccessor parameterAccessor) {
 
-		CassandraQueryCreator creator = new CassandraQueryCreator(tree, accessor, context);
-		return creator.createQuery().getQueryString();
+		if (isCountQuery()) {
+			return getQueryStatementCreator().count(getStatementFactory(), getTree(), parameterAccessor);
+		}
+
+		if (isExistsQuery()) {
+			return getQueryStatementCreator().exists(getStatementFactory(), getTree(), parameterAccessor);
+		}
+
+		return getQueryStatementCreator().select(getStatementFactory(), getTree(), parameterAccessor);
+	}
+
+	/* (non-Javadoc)
+	 * @see org.springframework.data.cassandra.repository.query.AbstractCassandraQuery#isCountQuery()
+	 */
+	@Override
+	protected boolean isCountQuery() {
+		return getTree().isCountProjection();
+	}
+
+	/* (non-Javadoc)
+	 * @see org.springframework.data.cassandra.repository.query.AbstractCassandraQuery#isExistsQuery()
+	 */
+	@Override
+	protected boolean isExistsQuery() {
+		return getTree().isExistsProjection();
+	}
+
+	/* (non-Javadoc)
+	 * @see org.springframework.data.cassandra.repository.query.AbstractCassandraQuery#isLimiting()
+	 */
+	@Override
+	protected boolean isLimiting() {
+		return getTree().isLimiting();
 	}
 }
